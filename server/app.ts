@@ -5,6 +5,7 @@ import { ResilientLLM, ProviderRegistry } from 'resilient-llm';
 import { getLibraryInfo } from './devutility.js';
 import { configureAllLlmProviders, configureLlmProvider, llmBaseUrl } from './llmProviders.js';
 import askRouter from './routes/ask.js';
+import { installPoolShutdown } from './db/pool.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -150,6 +151,8 @@ app.get('/api/models', async (req: Request, res: Response) => {
         });
     }
 });
+
+installPoolShutdown();
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);

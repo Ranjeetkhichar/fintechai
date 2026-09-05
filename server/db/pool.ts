@@ -48,21 +48,28 @@ function millis(value: string | undefined, fallback: number): number {
 }
 
 /**
+ * Routes a Neon host through PgBouncer. Direct connections each take a
+ * `max_connections` slot; the `-pooler` hostname does not.
+ */
+export function neonPooledHost(hostname: string): string {
+  if (!hostname.endsWith('.neon.tech') || hostname.includes('-pooler.')) return hostname;
+  return hostname.replace(/^([^.]+)\./, '$1-pooler.');
+}
+
+/**
  * Builds pool options from a connection string.
  *
- * Two Neon-specific adjustments. `channel_binding` is a libpq parameter that
- * node-postgres does not implement, and leaving it in the string has been known
- * to abort the handshake. `sslmode` is dropped in favour of an explicit `ssl`
- * object, which also silences the pg v9 deprecation warning about `require`
- * quietly meaning `verify-full`.
+ * Neon adjustments: drop `channel_binding` (libpq-only), replace `sslmode`
+ * with an explicit `ssl` object, send `*.neon.tech` through the pooler, and
+ * keep a single client. This process answers one question at a time; five
+ * idle clients plus nodemon leftovers exhaust a small Neon compute.
  */
-function buildPoolConfig(connectionString: string): pg.PoolConfig {
+export function buildPoolConfig(connectionString: string): pg.PoolConfig {
+  const parsedMax = Number(process.env.DB_POOL_MAX);
   const base: pg.PoolConfig = {
-    max: Number(process.env.DB_POOL_MAX || 5),
-    // Long idle window on purpose. Reaping a socket after 30s meant nearly every
-    // question paid for a fresh TLS handshake to a remote Neon endpoint, which is
-    // what runs past connectionTimeoutMillis. 0 disables reaping entirely.
-    idleTimeoutMillis: millis(process.env.DB_IDLE_TIMEOUT_MS, 300_000),
+    max: Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 1,
+    // Reap before Neon / the proxy closes the socket. 0 disables reaping.
+    idleTimeoutMillis: millis(process.env.DB_IDLE_TIMEOUT_MS, 60_000),
     // Generous enough for a suspended Neon compute to wake and finish a handshake.
     connectionTimeoutMillis: millis(process.env.DB_CONNECT_TIMEOUT_MS, 30_000),
     keepAlive: true,
@@ -76,6 +83,7 @@ function buildPoolConfig(connectionString: string): pg.PoolConfig {
     const url = new URL(connectionString);
     url.searchParams.delete('channel_binding');
     url.searchParams.delete('sslmode');
+    url.hostname = neonPooledHost(url.hostname);
 
     return {
       ...base,
@@ -111,49 +119,108 @@ export function getPool(): PgPool {
 }
 
 /**
- * Connect-phase failures, i.e. the pool never handed us a live client so the
- * statement provably never reached Postgres. Retrying one of these cannot
- * duplicate work. Errors raised once a query is in flight are not listed here.
+ * Socket and handshake failures where Postgres never returned a result.
+ *
+ * `query` is only used for SELECTs, so retrying these cannot duplicate work.
+ * `ECONNRESET` / `EPIPE` are the usual sign that Neon (or a proxy) closed an
+ * idle socket the pool still thought was live. Handshake timeouts cover a
+ * cold compute waking up.
  */
-const CONNECT_FAILURES = [
-  'Connection terminated due to connection timeout',
-  'timeout exceeded when trying to connect',
+const RETRYABLE_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
   'ETIMEDOUT',
   'ENETUNREACH',
-  'EHOSTUNREACH'
+  'EHOSTUNREACH',
+  '57P01',
+  '57P02',
+  '57P03',
+  '08006',
+  '08003',
+  '53300'
+]);
+
+const RETRYABLE_MESSAGES = [
+  'Connection terminated due to connection timeout',
+  'Connection terminated unexpectedly',
+  'timeout exceeded when trying to connect',
+  'read ECONNRESET',
+  'write EPIPE',
+  'socket hang up',
+  'early eof',
+  "Couldn't connect to compute node",
+  'too many connections',
+  'remaining connection slots'
 ];
 
-function isConnectFailure(error: unknown): boolean {
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/** True when Postgres never returned a result and a fresh socket might. */
+export function isRetryable(error: unknown): boolean {
+  const codes = [errorCode(error), errorCode((error as { cause?: unknown })?.cause)];
+  if (codes.some((code) => code && RETRYABLE_CODES.has(code))) return true;
+
   const message = error instanceof Error ? error.message : String(error);
-  return CONNECT_FAILURES.some((needle) => message.includes(needle));
+  return RETRYABLE_MESSAGES.some((needle) => message.includes(needle));
+}
+
+const QUERY_ATTEMPTS = 4;
+
+/** Wait before retry `attempt` (0-based). Immediate retry races a Neon cold start. */
+export function backoffMs(attempt: number): number {
+  return 1000 * 2 ** attempt;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
  * Runs a parameterized query. The only way Swiss Cheese reaches the database.
  *
- * Retried once, and only when the pool failed to open a connection at all. The
- * first request after an idle spell is the one that wakes a suspended compute,
- * and losing the user's answer to that is not acceptable.
+ * Retried with backoff when the socket died or the handshake never finished.
+ * Neon terminates idle connections when the compute suspends; the next query
+ * both gets ECONNRESET and has to wait for the compute to wake. A single
+ * immediate retry hits that window and fails the same way.
  */
 export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params: unknown[] = []
 ): Promise<T[]> {
-  try {
-    const result = await getPool().query<T>(text, params);
-    return result.rows;
-  } catch (error) {
-    if (!isConnectFailure(error)) throw error;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const result = await getPool().query<T>(text, params);
+      return result.rows;
+    } catch (error) {
+      if (!isRetryable(error) || attempt >= QUERY_ATTEMPTS - 1) throw error;
 
-    console.warn('postgres connect failed, retrying once:', (error as Error).message);
-    const result = await getPool().query<T>(text, params);
-    return result.rows;
+      const delay = backoffMs(attempt);
+      console.warn(
+        `postgres connection dropped, retrying in ${delay}ms:`,
+        (error as Error).message
+      );
+      await sleep(delay);
+    }
   }
 }
 
-/** Closes the pool. Used by scripts and the eval harness so they can exit. */
+/** Closes the pool. Used by scripts, the eval harness, and process shutdown. */
 export async function closePool(): Promise<void> {
   if (!pool) return;
   await pool.end();
   pool = null;
+}
+
+/** Releases the one Postgres client so a nodemon restart does not leak it. */
+export function installPoolShutdown(): void {
+  const onSignal = (): void => {
+    void closePool().finally(() => process.exit(0));
+  };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGUSR2'] as const) {
+    process.once(signal, onSignal);
+  }
 }
