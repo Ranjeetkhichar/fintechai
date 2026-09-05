@@ -1,0 +1,6 @@
+{
+  "spec": ["test/**/*.test.ts"],
+  "ignore": ["test/**/*.e2e.test.ts"],
+  "node-option": ["import=tsx"],
+  "timeout": 10000
+}

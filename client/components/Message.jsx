@@ -1,0 +1,170 @@
+/**
+ * Message Component - individual chat message
+ */
+import { useState, useEffect, useRef } from 'react';
+import { useApp } from '../context';
+import { renderMarkdown } from '../utils';
+import { AnswerCard } from './AnswerCard';
+import { FaCopy, FaRedo, FaCodeBranch, FaTimes, FaCheck, FaBug } from 'react-icons/fa';
+
+export function JsonView({ text }) {
+    try {
+        const parsed = JSON.parse(text);
+        return (
+            <div className="json-message-container">
+                <div className="json-message-toolbar"><span>JSON view</span></div>
+                <pre className="json-message-body">{JSON.stringify(parsed, null, 2)}</pre>
+            </div>
+        );
+    } catch {
+        return (
+            <div className="json-message-container">
+                <div className="json-message-toolbar"><span>JSON view</span></div>
+                <div className="json-message-error">Response is not valid JSON. Showing raw output.</div>
+                <pre className="json-message-body">{text}</pre>
+            </div>
+        );
+    }
+}
+
+export function Message({ message, responseFormat }) {
+    const { editMessage, deleteMessage, branchAtMessage, regenerateMessage, editingMessageId, setEditingMessageId, isResponding, setSelectedActivityMessageId, setIsBackendPanelOpen } = useApp();
+    const [editText, setEditText] = useState(message.text);
+    const [copied, setCopied] = useState(false);
+    const textareaRef = useRef();
+    const editTextRef = useRef(editText);
+    const wasEditingRef = useRef(false);
+    const isEditing = editingMessageId === message.id;
+
+    // Keep ref in sync with state
+    useEffect(() => {
+        editTextRef.current = editText;
+    }, [editText]);
+
+    useEffect(() => {
+        if (isEditing && textareaRef.current) {
+            textareaRef.current.focus();
+            textareaRef.current.style.height = 'auto';
+            textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+        }
+    }, [isEditing]);
+
+    // Save edit when editingMessageId changes away from this message (click outside)
+    useEffect(() => {
+        if (wasEditingRef.current && !isEditing) {
+            const currentText = editTextRef.current;
+            if (currentText.trim() !== message.text) {
+                editMessage(message.id, currentText.trim());
+            }
+        }
+        wasEditingRef.current = isEditing;
+    }, [isEditing, message.id, message.text, editMessage]);
+
+    const handleSave = () => {
+        if (editText.trim() !== message.text) {
+            editMessage(message.id, editText.trim());
+        } else {
+            setEditingMessageId(null);
+        }
+    };
+
+    const startEdit = () => {
+        setEditText(message.text);
+        setEditingMessageId(message.id);
+    };
+
+    const handleCopy = async () => {
+        try {
+            await navigator.clipboard.writeText(message.text);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+        } catch (err) {
+            console.error('Failed to copy:', err);
+        }
+    };
+
+    const isJson = message.role === 'assistant' && responseFormat === 'json';
+
+    return (
+        <div className={`message ${message.role} ${isEditing ? 'editing' : ''}`}>
+            <div className="message-avatar">{message.role === 'user' ? 'U' : '🧀'}</div>
+            <div className={`message-content ${isEditing ? 'message-content-editing' : ''} ${isJson ? 'message-content-json' : ''}`}>
+                {isEditing ? (
+                    <textarea
+                        ref={textareaRef}
+                        className="message-edit-textarea"
+                        value={editText}
+                        onChange={e => setEditText(e.target.value)}
+                        onKeyDown={e => {
+                            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSave(); }
+                            if (e.key === 'Escape') setEditingMessageId(null);
+                        }}
+                        rows={3}
+                    />
+                ) : (
+                    <>
+                        {message.role === 'assistant' && message.metadata && message.metadata.hint && (
+                            <div className="message-empty-response-hint" role="alert">
+                                <strong>Empty response</strong> — {message.metadata.hint}
+                            </div>
+                        )}
+                        <div className="message-text" onClick={startEdit} style={{ cursor: 'pointer' }}>
+                            {isJson ? (
+                                <JsonView text={message.text} />
+                            ) : (
+                                <div dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text || '') }} />
+                            )}
+                        </div>
+                        {message.payload && <AnswerCard payload={message.payload} />}
+                        <div className="message-actions">
+                            {message.role === 'assistant' && message.metadata && message.metadata.operation && (
+                                <button
+                                    className="message-action-btn"
+                                    title="View backend observability"
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        setSelectedActivityMessageId(message.id);
+                                        setIsBackendPanelOpen(true);
+                                    }}
+                                >
+                                    <FaBug />
+                                </button>
+                            )}
+                            <button
+                                className="message-copy-btn"
+                                title={copied ? "Copied!" : "Copy message"}
+                                onClick={handleCopy}
+                            >
+                                {copied ? <FaCheck /> : <FaCopy />}
+                            </button>
+                            {message.role === 'assistant' && (
+                                <button
+                                    className="message-action-btn"
+                                    title="Regenerate response (with cache turned off)"
+                                    onClick={() => regenerateMessage(message.id)}
+                                    disabled={isResponding}
+                                >
+                                    <FaRedo />
+                                </button>
+                            )}
+                            <button
+                                className="message-action-btn"
+                                title="Branch from here"
+                                onClick={() => branchAtMessage(message.id)}
+                            >
+                                <FaCodeBranch />
+                            </button>
+                            <button
+                                className="message-action-btn"
+                                title="Delete message"
+                                onClick={() => deleteMessage(message.id)}
+                            >
+                                <FaTimes />
+                            </button>
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
