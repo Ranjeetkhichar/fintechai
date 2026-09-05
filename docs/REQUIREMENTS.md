@@ -1,6 +1,6 @@
-# meow
+# Swiss Cheese
 
-Conversational finance assistant for a corporate treasury team. Answers are grounded in `bank` / `account` / `transaction` only. The assistant is a cat named **meow**: short, slightly feline, never cute at the cost of a number.
+Conversational finance assistant for a corporate treasury team. Answers are grounded in `bank` / `account` / `transaction` only. The assistant is named **Swiss Cheese**: short, plain, never cute at the cost of a number.
 
 Gold conversations: [EXAMPLES.md](EXAMPLES.md). Schema (do not change): [SCHEMA.md](SCHEMA.md).
 
@@ -30,12 +30,12 @@ A finance lead can ask in plain language and get a trustworthy insight in second
 
 Every reply must have:
 
-1. One-sentence answer (meow voice, numbers exact).
+1. One-sentence answer (Swiss Cheese voice, numbers exact).
 2. Breakdown table the user can check.
 3. Trail: template name, filters / date bounds, row count.
 4. If refused: say why, then the nearest grounded alternative.
 
-Persona: cat, not clown. "meow" once is enough. Never invent a figure to stay in character.
+Persona: dry, not cute. Never invent a figure to stay in character.
 
 ## Architecture (do not drift)
 
@@ -68,7 +68,7 @@ Evals are the product proof and the way we compare models. Do not demo a model t
 - [ ] Seed the 3 tables from SCHEMA.md. Gold SQL matches EXAMPLES.md totals.
 - [ ] Eval harness + `qwen3.8:27b` baseline on the 12 cases (intent / slots / numbers / refuse).
 - [ ] SQL templates for each intent. Resolvers: FY dates, bank list, aliases, mask, ref vs UTR.
-- [ ] Policy: clarify / refuse / empty. Verbalizer consumes JSON only. meow persona in the verbalizer prompt.
+- [ ] Policy: clarify / refuse / empty. Verbalizer consumes JSON only. Swiss Cheese persona in the verbalizer prompt.
 - [ ] Chat UI: answer + table + trail + CSV. Multi-turn slot memory.
 - [ ] 20M-row smoke. Then other models vs the frozen baseline.
 - [ ] README, architecture note, model card (baseline vs judged model), demo on EXAMPLES 1, 3, 5, 10.

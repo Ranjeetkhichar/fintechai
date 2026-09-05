@@ -100,7 +100,7 @@ May rows, for the check:
 | 14 May 2026 11:31 | HDFC 5020****4137 | Navyug Selection | 50,000.00 | 103293775381 |
 | 20 May 2026 09:49 | HDFC 5020****4137 | Reliance Digital Retail Ltd, Select City Saket | 21,156.00 | 1643797818 |
 
-How this was produced: template `compare_period`, reused June filters, shifted to 2026-05-01 to 2026-05-30. This is period movement, not a change in available balance.
+How this was produced: template `compare_period`, reused June filters, shifted to 2026-05-01 to 2026-05-31. This is period movement, not a change in available balance.
 
 ---
 

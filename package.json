@@ -1,0 +1,51 @@
+{
+  "name": "swiss-cheese",
+  "version": "0.1.0",
+  "description": "Swiss Cheese: conversational finance assistant for group treasury",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "client": "vite",
+    "server": "nodemon",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "tsx server/app.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "mocha",
+    "test:e2e": "mocha --config .mocharc.e2e.json",
+    "db:ping": "tsx --env-file=.env db/ping.ts",
+    "db:setup": "tsx --env-file=.env db/setup.ts",
+    "db:bulk": "tsx --env-file=.env db/generate-bulk.ts",
+    "db:explain": "tsx --env-file=.env db/explain.ts",
+    "eval": "tsx --env-file=.env eval/run.ts"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pg": "^8.13.1",
+    "react-icons": "^5.3.0",
+    "resilient-llm": "^1.8.2"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.0.1",
+    "@types/express": "^5.0.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^24.x",
+    "@types/pg": "^8.11.10",
+    "@types/sinon": "^17.0.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "chai": "^5.1.2",
+    "concurrently": "^9.2.1",
+    "marked": "^17.0.1",
+    "mocha": "^11.0.1",
+    "nodemon": "^3.0.2",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "sinon": "^19.0.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^7.3.0"
+  },
+  "engines": {
+    "node": ">=24.x"
+  }
+}

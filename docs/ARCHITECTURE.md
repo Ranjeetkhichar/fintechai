@@ -1,10 +1,10 @@
-# meow - architecture
+# Swiss Cheese - architecture
 
 Spec: [REQUIREMENTS.md](REQUIREMENTS.md) · Gold answers: [EXAMPLES.md](EXAMPLES.md) · Schema: [SCHEMA.md](SCHEMA.md)
 
 ## Core idea
 
-meow is a **query engine with a cat on top**. The model never touches the database and never does arithmetic. It fills slots on the way in and reads a computed JSON payload on the way out. Everything between those two points is deterministic code.
+Swiss Cheese is a **query engine with a thin voice on top**. The model never touches the database and never does arithmetic. It fills slots on the way in and reads a computed JSON payload on the way out. Everything between those two points is deterministic code.
 
 That single split is what makes a hallucinated figure structurally impossible: the verbalizer has no numbers except the ones SQL produced.
 
@@ -58,7 +58,7 @@ sequenceDiagram
     DB-->>SQL: totals + capped rows
     SQL-->>API: AnswerPayload (masked)
     API->>LLM: verbalize(payload)
-    LLM-->>API: one sentence, meow voice
+    LLM-->>API: one sentence, Swiss Cheese voice
     API-->>U: sentence + table + trail
 ```
 

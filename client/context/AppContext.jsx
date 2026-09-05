@@ -1,0 +1,930 @@
+/**
+ * App Provider - global state (context + hook live in context.js for Fast Refresh)
+ */
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { AppContext } from './context';
+import {
+    Storage,
+    generateId,
+    ASK_API_URL,
+    ABORT_API_URL,
+    getApiKey,
+    THEME_STORAGE_KEY,
+    DEFAULT_PROMPT_NAME,
+    createDefaultSystemMessage,
+    buildExportPayload,
+    serializeToJson,
+    serializeToText,
+    parseImportFile,
+    sanitizeMessagesForImport,
+    messagesForExport,
+    downloadText,
+    suggestedExportFilename
+} from '../utils';
+import { useServerHealth } from '../hooks/useServerHealth';
+
+/**
+ * Formats a chat/API failure for an assistant bubble, with a clearer aborted label.
+ */
+function formatChatFailureText(dataOrError, wasAborted) {
+    if (wasAborted || dataOrError?.aborted) {
+        return 'Request stopped';
+    }
+    const message = typeof dataOrError === 'string'
+        ? dataOrError
+        : (dataOrError?.error || dataOrError?.message || 'No response');
+    if (/aborted|cancelled/i.test(message)) {
+        return 'Request stopped';
+    }
+    return `Error: ${message}`;
+}
+
+/**
+ * Determines which config sections changed between two config objects.
+ */
+function getConfigChangeSections(prevConfig, nextConfig) {
+    const MODEL_KEYS = ['service', 'model', 'temperature', 'maxTokens', 'topP', 'responseFormat'];
+    const RESILIENCE_KEYS = [
+        'retries',
+        'backoffFactor',
+        'timeout',
+        'requestsPerMinute',
+        'llmTokensPerMinute',
+        'circuitBreakerFailureThreshold',
+        'circuitBreakerCooldownPeriod',
+        'maxConcurrent',
+        'enableCache'
+    ];
+
+    const changed = (key) => {
+        const a = prevConfig?.[key];
+        const b = nextConfig?.[key];
+        return JSON.stringify(a) !== JSON.stringify(b);
+    };
+
+    return {
+        modelsChanged: MODEL_KEYS.some(changed),
+        resilienceChanged: RESILIENCE_KEYS.some(changed)
+    };
+}
+
+/**
+ * Calls the grounded treasury endpoint.
+ *
+ * Only the model choice travels from the settings drawer. Intent, filters, SQL
+ * and masking are decided on the server, so nothing the client sends can change
+ * a figure.
+ */
+async function askCheese(question, conversationId, config) {
+    const service = config.service === 'local' ? 'ollama' : config.service;
+    const apiKey = getApiKey(service);
+
+    const response = await fetch(ASK_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            question,
+            conversationId,
+            llmOptions: {
+                service,
+                model: config.model,
+                timeout: Number(config.timeout) || undefined,
+                ...(apiKey && { apiKey })
+            }
+        })
+    });
+
+    return response.json();
+}
+
+/**
+ * App Provider - wraps the application with global state
+ */
+export function AppProvider({ children }) {
+    const { serverHealth, refreshServerHealth, reportApiSuccess, reportApiFailure } = useServerHealth();
+    const [prompts, setPrompts] = useState([]);
+    const [currentPromptId, setCurrentPromptId] = useState(null);
+    const [activeConversationId, setActiveConversationId] = useState(null);
+    const [messages, setMessages] = useState([]);
+    const [config, setConfig] = useState({
+        service: 'openai', model: 'gpt-5-nano', temperature: '0.7',
+        maxTokens: '2048', responseFormat: 'text',
+        // Resilience settings
+        retries: '3',
+        backoffFactor: '2',
+        timeout: '180000',
+        requestsPerMinute: '60',
+        llmTokensPerMinute: '90000',
+        circuitBreakerFailureThreshold: '5',
+        circuitBreakerCooldownPeriod: '30000',
+        maxConcurrent: '',
+        enableCache: true
+    });
+    const [isResponding, setIsResponding] = useState(false);
+    const [settingsOpen, setSettingsOpen] = useState(false);
+    const [settingsDefaultSection, setSettingsDefaultSection] = useState('models'); // 'models' or 'resilience'
+    const [senderRole, setSenderRole] = useState('user');
+    const [editingMessageId, setEditingMessageId] = useState(null);
+    const [undoNotification, setUndoNotification] = useState(null);
+    const [configSavedModels, setConfigSavedModels] = useState(false);
+    const [configSavedResilience, setConfigSavedResilience] = useState(false);
+    const [currentRoute, setCurrentRoute] = useState('playground'); // 'playground' or 'token-bucket'
+    const [selectedActivityMessageId, setSelectedActivityMessageId] = useState(null);
+    const [isBackendPanelOpen, setIsBackendPanelOpen] = useState(false);
+    const [theme, setThemeState] = useState(() => {
+        try {
+            const stored = localStorage.getItem(THEME_STORAGE_KEY);
+            return stored === 'dark' ? 'dark' : 'light';
+        } catch {
+            return 'light';
+        }
+    });
+    const undoStackRef = useRef([]);
+    const undoTimeoutRef = useRef(null);
+    const previousConfigRef = useRef(null);
+    const messagesRef = useRef([]);
+    const activeConversationIdRef = useRef(null);
+    const currentPromptIdRef = useRef(null);
+    const requestSeqRef = useRef(0);
+    const abortRequestedRef = useRef(false);
+
+    useEffect(() => {
+        activeConversationIdRef.current = activeConversationId;
+        currentPromptIdRef.current = currentPromptId;
+    }, [activeConversationId, currentPromptId]);
+
+    /**
+     * Persists a message to a specific conversation in storage (even if not active).
+     */
+    const persistMessageToConversation = useCallback((conversationId, msg) => {
+        if (!conversationId || !msg) return false;
+        const all = Storage.get('conversations');
+        const idx = all.findIndex(c => c.id === conversationId);
+        if (idx < 0) return false;
+        const prev = all[idx].messages || [];
+        all[idx].messages = [...prev, msg];
+        all[idx].updatedAt = new Date().toISOString();
+        Storage.set('conversations', all);
+        return true;
+    }, []);
+
+    // Load prompts from storage
+    const refreshPrompts = useCallback(() => {
+        const data = Storage.get('prompts')
+            .map(p => ({ ...p }))
+            .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+        setPrompts(data);
+    }, []);
+
+    // Get versions for a prompt
+    const getVersions = useCallback((promptId) => {
+        return Storage.get('versions')
+            .filter(v => v.promptId === promptId)
+            .sort((a, b) => {
+                const numA = parseInt(a.id.replace('v', ''), 10);
+                const numB = parseInt(b.id.replace('v', ''), 10);
+                return numA - numB;
+            });
+    }, []);
+
+    // Get conversations for a prompt
+    const getConversations = useCallback((promptId) => {
+        return Storage.get('conversations')
+            .filter(c => c.promptId === promptId)
+            .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    }, []);
+
+    // Get best version for a prompt (explicitly marked or latest)
+    const getBestVersion = useCallback((promptId) => {
+        const prompt = Storage.get('prompts').find(p => p.id === promptId);
+        if (!prompt) return null;
+        
+        const versions = getVersions(promptId);
+        if (versions.length === 0) return null;
+        
+        if (prompt.bestVersionId) {
+            const best = versions.find(v => v.id === prompt.bestVersionId);
+            if (best) return best;
+        }
+        
+        // Default to latest
+        return versions[versions.length - 1];
+    }, [getVersions]);
+
+    // Toggle best version
+    const toggleBestVersion = useCallback((versionId) => {
+        if (!currentPromptId) return;
+        
+        const all = Storage.get('prompts');
+        const idx = all.findIndex(p => p.id === currentPromptId);
+        if (idx < 0) return;
+        
+        const prompt = all[idx];
+        const versions = getVersions(currentPromptId);
+        const version = versions.find(v => v.id === versionId);
+        if (!version) return;
+        
+        const bestVersion = getBestVersion(currentPromptId);
+        const isBest = bestVersion?.id === versionId;
+        const isExplicitBest = prompt.bestVersionId === versionId;
+        
+        if (isBest && isExplicitBest) {
+            // Unset explicit best, go back to "latest is best"
+            all[idx].bestVersionId = null;
+        } else if (!isBest) {
+            // Mark this version as best
+            all[idx].bestVersionId = versionId;
+        } else if (isBest && !isExplicitBest) {
+            // If isBest but not explicit (it's latest), clicking sets it as explicit best
+            all[idx].bestVersionId = versionId;
+        }
+        
+        all[idx].updatedAt = new Date().toISOString();
+        Storage.set('prompts', all);
+        refreshPrompts();
+    }, [currentPromptId, getVersions, getBestVersion, refreshPrompts]);
+
+    // Load conversation messages
+    const loadConversation = useCallback((conversationId) => {
+        const conv = Storage.get('conversations').find(c => c.id === conversationId);
+        if (conv) {
+            const loadedMessages = conv.messages || [];
+            setMessages(loadedMessages);
+            messagesRef.current = loadedMessages;
+            setActiveConversationId(conversationId);
+            if (conv.config) {
+                const newConfig = { ...config, ...conv.config };
+                setConfig(newConfig);
+                previousConfigRef.current = { ...newConfig };
+            } else {
+                previousConfigRef.current = { ...config };
+            }
+        }
+    }, [config]);
+
+    // Save current conversation
+    const saveConversation = useCallback(() => {
+        if (!activeConversationId) return;
+        const all = Storage.get('conversations');
+        const idx = all.findIndex(c => c.id === activeConversationId);
+        if (idx >= 0) {
+            const configChanged = JSON.stringify(previousConfigRef.current) !== JSON.stringify(config);
+            all[idx].messages = messages;
+            all[idx].config = config;
+            all[idx].updatedAt = new Date().toISOString();
+            Storage.set('conversations', all);
+            
+            // Trigger pulse if config changed
+            if (configChanged) {
+                const { modelsChanged, resilienceChanged } = getConfigChangeSections(previousConfigRef.current, config);
+                previousConfigRef.current = { ...config };
+                if (modelsChanged) {
+                    setConfigSavedModels(true);
+                    setTimeout(() => setConfigSavedModels(false), 100);
+                }
+                if (resilienceChanged) {
+                    setConfigSavedResilience(true);
+                    setTimeout(() => setConfigSavedResilience(false), 100);
+                }
+            }
+        }
+    }, [activeConversationId, messages, config]);
+
+    // Create new prompt
+    const createPrompt = useCallback(() => {
+        saveConversation();
+        const promptId = generateId();
+        const convId = 'conv-' + generateId();
+        const now = new Date().toISOString();
+        
+        Storage.set('prompts', [...Storage.get('prompts'), {
+            id: promptId, name: DEFAULT_PROMPT_NAME, bestVersionId: null,
+            createdAt: now, updatedAt: now
+        }]);
+        const seededMessages = [createDefaultSystemMessage()];
+        Storage.set('conversations', [...Storage.get('conversations'), {
+            id: convId, promptId, messages: seededMessages, config: {},
+            origin: { type: 'fresh' }, createdAt: now, updatedAt: now
+        }]);
+        
+        setCurrentPromptId(promptId);
+        setActiveConversationId(convId);
+        setMessages(seededMessages);
+        messagesRef.current = seededMessages;
+        refreshPrompts();
+    }, [saveConversation, refreshPrompts]);
+
+    // Open prompt
+    const openPrompt = useCallback((promptId) => {
+        saveConversation();
+        setCurrentPromptId(promptId);
+        const convs = getConversations(promptId);
+        if (convs.length > 0) {
+            loadConversation(convs[0].id);
+        } else {
+            const convId = 'conv-' + generateId();
+            const now = new Date().toISOString();
+            const seededMessages = [createDefaultSystemMessage()];
+            Storage.set('conversations', [...Storage.get('conversations'), {
+                id: convId, promptId, messages: seededMessages, config: {},
+                origin: { type: 'fresh' }, createdAt: now, updatedAt: now
+            }]);
+            setActiveConversationId(convId);
+            setMessages(seededMessages);
+            messagesRef.current = seededMessages;
+        }
+        refreshPrompts();
+    }, [saveConversation, getConversations, loadConversation, refreshPrompts]);
+
+    // Delete prompt
+    const deletePrompt = useCallback((promptId) => {
+        if (!confirm('Delete this prompt and all its data?')) return;
+        Storage.set('prompts', Storage.get('prompts').filter(p => p.id !== promptId));
+        Storage.set('versions', Storage.get('versions').filter(v => v.promptId !== promptId));
+        Storage.set('conversations', Storage.get('conversations').filter(c => c.promptId !== promptId));
+        
+        if (promptId === currentPromptId) {
+            const remaining = Storage.get('prompts');
+            if (remaining.length > 0) openPrompt(remaining[0].id);
+            else createPrompt();
+        }
+        refreshPrompts();
+    }, [currentPromptId, openPrompt, createPrompt, refreshPrompts]);
+
+    // Rename prompt
+    const renamePrompt = useCallback((promptId, newName) => {
+        const all = Storage.get('prompts');
+        const idx = all.findIndex(p => p.id === promptId);
+        if (idx >= 0 && newName.trim()) {
+            all[idx].name = newName.trim();
+            all[idx].updatedAt = new Date().toISOString();
+            Storage.set('prompts', all);
+            refreshPrompts();
+        }
+    }, [refreshPrompts]);
+
+    // Add message (optional meta e.g. metadata for empty-response hints)
+    const addMessage = useCallback((text, role, meta) => {
+        const newMsg = {
+            id: generateId(),
+            text: text ?? '',
+            role,
+            timestamp: new Date().toISOString(),
+            ...(meta && { metadata: meta })
+        };
+        setMessages(prev => {
+            const updated = [...prev, newMsg];
+            messagesRef.current = updated;
+            return updated;
+        });
+        return newMsg;
+    }, []);
+
+    // Show undo notification
+    const showUndoNotification = useCallback(() => {
+        if (undoTimeoutRef.current) clearTimeout(undoTimeoutRef.current);
+        setUndoNotification(true);
+        undoTimeoutRef.current = setTimeout(() => setUndoNotification(false), 5000);
+    }, []);
+
+    // Hide undo notification
+    const hideUndoNotification = useCallback(() => {
+        if (undoTimeoutRef.current) clearTimeout(undoTimeoutRef.current);
+        setUndoNotification(false);
+    }, []);
+
+    // Delete message
+    const deleteMessage = useCallback((messageId) => {
+        setMessages(prev => {
+            const idx = prev.findIndex(m => m.id === messageId);
+            if (idx >= 0) {
+                undoStackRef.current.push({ type: 'delete', message: prev[idx], index: idx });
+            }
+            const updated = prev.filter(m => m.id !== messageId);
+            messagesRef.current = updated;
+            return updated;
+        });
+        showUndoNotification();
+    }, [showUndoNotification]);
+
+    // Edit message
+    const editMessage = useCallback((messageId, newText) => {
+        setMessages(prev => {
+            const updated = prev.map(m => {
+                if (m.id === messageId) {
+                    undoStackRef.current.push({ type: 'edit', messageId, oldText: m.text });
+                    return { ...m, text: newText, originalText: m.text };
+                }
+                return m;
+            });
+            messagesRef.current = updated;
+            return updated;
+        });
+        setEditingMessageId(null);
+        showUndoNotification();
+    }, [showUndoNotification]);
+
+    // Undo last action
+    const undo = useCallback(() => {
+        const action = undoStackRef.current.pop();
+        if (!action) return;
+        if (action.type === 'delete') {
+            setMessages(prev => {
+                const copy = [...prev];
+                copy.splice(action.index, 0, action.message);
+                messagesRef.current = copy;
+                return copy;
+            });
+        } else if (action.type === 'edit') {
+            setMessages(prev => {
+                const updated = prev.map(m => 
+                    m.id === action.messageId ? { ...m, text: action.oldText } : m
+                );
+                messagesRef.current = updated;
+                return updated;
+            });
+        } else if (action.type === 'system-prompt') {
+            setMessages(prev => {
+                const systemMsg = prev.find(m => m.role === 'system');
+                let updated;
+                if (action.hadSystem) {
+                    // Restore old text
+                    if (systemMsg) {
+                        updated = prev.map(m => 
+                            m.role === 'system' ? { ...m, text: action.oldText } : m
+                        );
+                    } else {
+                        // System message was deleted, restore it
+                        updated = [{ 
+                            id: action.systemMessageId || 'system-' + Date.now(), 
+                            text: action.oldText, 
+                            role: 'system', 
+                            timestamp: new Date().toISOString() 
+                        }, ...prev];
+                    }
+                } else {
+                    // System message didn't exist before, remove it
+                    updated = prev.filter(m => m.role !== 'system');
+                }
+                messagesRef.current = updated;
+                return updated;
+            });
+        }
+        hideUndoNotification();
+    }, [hideUndoNotification]);
+
+    // Send message and get AI response
+    const sendMessage = useCallback(async (text, role) => {
+        if (!text.trim() || isResponding) return;
+
+        if (!currentPromptId) {
+            createPrompt();
+        }
+
+        const requestId = `req-${++requestSeqRef.current}`;
+        const originConversationId = activeConversationIdRef.current;
+        const originPromptId = currentPromptIdRef.current;
+
+        // Normalize role: default to 'user' to prevent accidental assistant messages
+        // This fixes the bug where senderRole state might be corrupted
+        const actualRole = (role === 'assistant') ? 'assistant' : 'user';
+        const userMsg = addMessage(text, actualRole);
+        
+        // Reset senderRole to 'user' after sending (unless it was intentionally set to assistant)
+        // This ensures the next message defaults to 'user'
+        if (role !== 'assistant') {
+            setSenderRole('user');
+        }
+        
+        // If role is not 'user', don't send to API (user manually added assistant message)
+        if (actualRole !== 'user') {
+            return;
+        }
+
+        setIsResponding(true);
+        abortRequestedRef.current = false;
+        try {
+            const data = await askCheese(text, originConversationId, config);
+            reportApiSuccess();
+
+            const targetConversationId = originConversationId;
+            const shouldApplyToActiveUI = targetConversationId && targetConversationId === activeConversationIdRef.current;
+            const wasAborted = abortRequestedRef.current || data.aborted;
+
+            const assistantMsg = {
+                id: generateId(),
+                text: data.success ? (data.sentence || '') : formatChatFailureText(data, wasAborted),
+                role: 'assistant',
+                timestamp: new Date().toISOString(),
+                // The payload is the grounded part of the answer: table, trail and
+                // notes render from it even if the phrasing above is poor.
+                ...(data.payload && { payload: data.payload }),
+                ...(data.success && { metadata: { cheese: { model: data.model, stats: data.stats } } })
+            };
+
+            persistMessageToConversation(targetConversationId, assistantMsg);
+            if (shouldApplyToActiveUI) {
+                setMessages(prev => {
+                    const updated = [...prev, assistantMsg];
+                    messagesRef.current = updated;
+                    return updated;
+                });
+            }
+        } catch (error) {
+            reportApiFailure(error);
+            addMessage(formatChatFailureText(error, abortRequestedRef.current), 'assistant');
+        } finally {
+            abortRequestedRef.current = false;
+            setIsResponding(false);
+        }
+    }, [isResponding, currentPromptId, createPrompt, addMessage, config, persistMessageToConversation, reportApiSuccess, reportApiFailure]);
+
+    /** Ask the Swiss Cheese server to abort the in-flight ResilientLLM request. */
+    const abortRequest = useCallback(async () => {
+        if (!isResponding) return;
+        abortRequestedRef.current = true;
+        try {
+            await fetch(ABORT_API_URL, { method: 'POST' });
+            reportApiSuccess();
+        } catch (error) {
+            reportApiFailure(error);
+        }
+    }, [isResponding, reportApiSuccess, reportApiFailure]);
+
+    // Regenerate assistant message
+    const regenerateMessage = useCallback(async (messageId) => {
+        if (isResponding) return;
+
+        // Use messagesRef to get the latest messages
+        const currentMessages = messagesRef.current;
+        const messageIndex = currentMessages.findIndex(m => m.id === messageId);
+        if (messageIndex === -1) return;
+
+        const message = currentMessages[messageIndex];
+        if (message.role !== 'assistant') return;
+
+        // Re-ask the question that produced this answer.
+        const priorUserMessage = [...currentMessages.slice(0, messageIndex)].reverse().find(m => m.role === 'user');
+        if (!priorUserMessage) return;
+
+        setIsResponding(true);
+        abortRequestedRef.current = false;
+        try {
+            const data = await askCheese(priorUserMessage.text, activeConversationIdRef.current, config);
+            reportApiSuccess();
+
+            // Replace only this specific assistant message with the new response
+            // Read latest messages from ref to handle any concurrent updates
+            const latestMessages = messagesRef.current;
+            const messageStillExists = latestMessages.some(m => m.id === messageId);
+            
+            if (!messageStillExists) {
+                // Message was deleted or changed, abort
+                return;
+            }
+
+            const wasAborted = abortRequestedRef.current || data.aborted;
+
+            const updated = latestMessages.map(m =>
+                m.id === messageId
+                    ? {
+                        ...m,
+                        text: data.success ? (data.sentence || '') : formatChatFailureText(data, wasAborted),
+                        timestamp: new Date().toISOString(),
+                        payload: data.payload ?? m.payload,
+                        ...(data.success && { metadata: { ...(m.metadata || {}), cheese: { model: data.model, stats: data.stats } } })
+                    }
+                    : m
+            );
+            messagesRef.current = updated;
+            setMessages([...updated]);
+        } catch (error) {
+            reportApiFailure(error);
+            const latestMessages = messagesRef.current;
+            const updated = latestMessages.map(m => 
+                m.id === messageId 
+                    ? { ...m, text: formatChatFailureText(error, abortRequestedRef.current), timestamp: new Date().toISOString() }
+                    : m
+            );
+            messagesRef.current = updated;
+            setMessages([...updated]);
+        } finally {
+            abortRequestedRef.current = false;
+            setIsResponding(false);
+        }
+    }, [isResponding, config, reportApiSuccess, reportApiFailure]);
+
+    // Save version
+    const saveVersion = useCallback((notes = '') => {
+        if (!currentPromptId || messages.length === 0) return;
+        const versions = getVersions(currentPromptId);
+        const versionId = `v${versions.length + 1}`;
+        const now = new Date().toISOString();
+        const versionMessageCount = messages.filter(m => m.role !== 'system').length;
+        
+        Storage.set('versions', [...Storage.get('versions'), {
+            id: versionId, promptId: currentPromptId, messages, config,
+            parentVersionId: null, notes, createdAt: now
+        }]);
+        
+        const all = Storage.get('conversations');
+        const idx = all.findIndex(c => c.id === activeConversationId);
+        if (idx >= 0) {
+            all[idx].origin = { 
+                type: 'version', 
+                sourceId: versionId,
+                versionMessageCount 
+            };
+            Storage.set('conversations', all);
+        }
+        
+        const updatedMessages = [...messages];
+        setMessages(updatedMessages);
+        messagesRef.current = updatedMessages;
+    }, [currentPromptId, activeConversationId, messages, config, getVersions]);
+
+    // Load version
+    const loadVersion = useCallback((versionId) => {
+        const version = Storage.get('versions').find(v => 
+            v.id === versionId && v.promptId === currentPromptId
+        );
+        if (!version) return;
+        
+        const versionMessageCount = (version.messages || []).filter(m => m.role !== 'system').length;
+        
+        const convId = 'conv-' + generateId();
+        const now = new Date().toISOString();
+        Storage.set('conversations', [...Storage.get('conversations'), {
+            id: convId, promptId: currentPromptId,
+            messages: version.messages, config: version.config || {},
+            origin: { type: 'version', sourceId: versionId, versionMessageCount },
+            createdAt: now, updatedAt: now
+        }]);
+        
+        loadConversation(convId);
+    }, [currentPromptId, loadConversation]);
+
+    // Delete version
+    const deleteVersion = useCallback((versionId) => {
+        if (!confirm(`Delete ${versionId}?`)) return;
+        Storage.set('versions', Storage.get('versions').filter(v => 
+            !(v.id === versionId && v.promptId === currentPromptId)
+        ));
+    }, [currentPromptId]);
+
+    // New conversation
+    const newConversation = useCallback(() => {
+        saveConversation();
+        const convId = 'conv-' + generateId();
+        const now = new Date().toISOString();
+        const seededMessages = [createDefaultSystemMessage()];
+        Storage.set('conversations', [...Storage.get('conversations'), {
+            id: convId, promptId: currentPromptId, messages: seededMessages, config: {},
+            origin: { type: 'fresh' }, createdAt: now, updatedAt: now
+        }]);
+        setActiveConversationId(convId);
+        setMessages(seededMessages);
+        messagesRef.current = seededMessages;
+    }, [currentPromptId, saveConversation]);
+
+    // Switch conversation
+    const switchConversation = useCallback((convId) => {
+        saveConversation();
+        loadConversation(convId);
+    }, [saveConversation, loadConversation]);
+
+    // Delete conversation
+    const deleteConversation = useCallback((convId) => {
+        const convs = getConversations(currentPromptId);
+        if (convId === activeConversationId && convs.length === 1) {
+            if (!confirm('Delete this conversation?')) return;
+        }
+        Storage.set('conversations', Storage.get('conversations').filter(c => c.id !== convId));
+        if (convId === activeConversationId) {
+            const remaining = getConversations(currentPromptId);
+            if (remaining.length > 0) loadConversation(remaining[0].id);
+            else newConversation();
+        }
+    }, [currentPromptId, activeConversationId, getConversations, loadConversation, newConversation]);
+
+    // Branch at message
+    const branchAtMessage = useCallback((messageId) => {
+        const idx = messages.findIndex(m => m.id === messageId);
+        if (idx === -1) return;
+        
+        saveConversation();
+        const convId = 'conv-' + generateId();
+        const now = new Date().toISOString();
+        const branchedMessages = messages.slice(0, idx + 1).map(m => ({
+            ...m, id: generateId()
+        }));
+        
+        Storage.set('conversations', [...Storage.get('conversations'), {
+            id: convId, promptId: currentPromptId, messages: branchedMessages,
+            config, origin: { type: 'branch', sourceId: activeConversationId },
+            createdAt: now, updatedAt: now
+        }]);
+        
+        loadConversation(convId);
+    }, [messages, currentPromptId, activeConversationId, config, saveConversation, loadConversation]);
+
+    // Export active conversation as JSON or plain text (messages only, no config/metadata).
+    const exportConversation = useCallback((format) => {
+        saveConversation();
+        const exportMessages = messagesForExport(messages, editingMessageId);
+        if (exportMessages.length === 0) {
+            return { ok: false, error: 'No messages to export' };
+        }
+        const promptName = prompts.find(p => p.id === currentPromptId)?.name;
+        const payload = buildExportPayload({ promptName, messages: exportMessages });
+        const isText = format === 'text';
+        const content = isText ? serializeToText(payload) : serializeToJson(payload);
+        const ext = isText ? 'txt' : 'json';
+        const mimeType = isText ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8';
+        downloadText(suggestedExportFilename(promptName, ext), content, mimeType);
+        return { ok: true };
+    }, [saveConversation, messages, prompts, currentPromptId, editingMessageId]);
+
+    // Import conversation file into a new conversation on the current prompt.
+    const importConversation = useCallback(async (file) => {
+        if (isResponding) {
+            return { ok: false, error: 'Wait for the current response to finish before importing.' };
+        }
+        if (!currentPromptId) {
+            return { ok: false, error: 'Open a prompt before importing a conversation.' };
+        }
+        if (!file) {
+            return { ok: false, error: 'No file selected.' };
+        }
+        try {
+            saveConversation();
+            const text = await file.text();
+            const payload = parseImportFile(text, file.name);
+            const importedMessages = sanitizeMessagesForImport(payload.messages);
+            const convId = 'conv-' + generateId();
+            const now = new Date().toISOString();
+            Storage.set('conversations', [...Storage.get('conversations'), {
+                id: convId,
+                promptId: currentPromptId,
+                messages: importedMessages,
+                config: {},
+                origin: { type: 'import' },
+                createdAt: now,
+                updatedAt: now
+            }]);
+            loadConversation(convId);
+            return { ok: true };
+        } catch (err) {
+            return { ok: false, error: err.message || 'Failed to import conversation.' };
+        }
+    }, [isResponding, currentPromptId, saveConversation, loadConversation]);
+
+    // Set system prompt
+    const setSystemPrompt = useCallback((text) => {
+        setMessages(prev => {
+            const systemMsg = prev.find(m => m.role === 'system');
+            const oldText = systemMsg?.text || '';
+            const hasSystem = !!systemMsg;
+            
+            // Store undo action
+            if (text.trim() !== oldText.trim()) {
+                undoStackRef.current.push({ 
+                    type: 'system-prompt', 
+                    oldText: oldText,
+                    hadSystem: hasSystem,
+                    systemMessageId: systemMsg?.id
+                });
+            }
+            
+            let updated;
+            if (text.trim()) {
+                if (hasSystem) {
+                    updated = prev.map(m => m.role === 'system' ? { ...m, text } : m);
+                } else {
+                    updated = [{ id: 'system-' + Date.now(), text, role: 'system', timestamp: new Date().toISOString() }, ...prev];
+                }
+            } else {
+                updated = prev.filter(m => m.role !== 'system');
+            }
+            messagesRef.current = updated;
+            return updated;
+        });
+        showUndoNotification();
+    }, [showUndoNotification]);
+
+    // Get current prompt
+    const currentPrompt = useMemo(() => 
+        prompts.find(p => p.id === currentPromptId), 
+        [prompts, currentPromptId]
+    );
+
+    // Auto-save
+    useEffect(() => {
+        const interval = setInterval(saveConversation, 30000);
+        window.addEventListener('beforeunload', saveConversation);
+        return () => {
+            clearInterval(interval);
+            window.removeEventListener('beforeunload', saveConversation);
+        };
+    }, [saveConversation]);
+
+    // Initial load
+    useEffect(() => {
+        refreshPrompts();
+        const existing = Storage.get('prompts');
+        if (existing.length > 0) {
+            openPrompt(existing[0].id);
+        } else {
+            createPrompt();
+        }
+    }, []);
+
+    // Apply theme to document and persist
+    useEffect(() => {
+        document.documentElement.setAttribute('data-theme', theme);
+        try {
+            localStorage.setItem(THEME_STORAGE_KEY, theme);
+        } catch { /* ignore */ }
+    }, [theme]);
+
+    const setTheme = useCallback((next) => {
+        setThemeState(prev => (next === 'dark' || next === 'light' ? next : prev === 'light' ? 'dark' : 'light'));
+    }, []);
+
+    // Keyboard shortcuts
+    useEffect(() => {
+        const handler = (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+                // Let the browser handle undo/redo while typing in a field
+                const el = e.target;
+                if (el instanceof HTMLTextAreaElement) return;
+                if (el instanceof HTMLElement && el.isContentEditable) return;
+                if (el instanceof HTMLInputElement) {
+                    const type = (el.type || 'text').toLowerCase();
+                    const nonText = ['button', 'checkbox', 'radio', 'submit', 'reset', 'file', 'hidden', 'image', 'range', 'color'];
+                    if (!nonText.includes(type)) return;
+                }
+                e.preventDefault();
+                undo();
+            }
+        };
+        document.addEventListener('keydown', handler);
+        return () => document.removeEventListener('keydown', handler);
+    }, [undo]);
+
+    // Click outside to save/close editing
+    useEffect(() => {
+        const handler = (e) => {
+            if (!editingMessageId) return;
+            
+            const clickedTextarea = e.target.closest('textarea');
+            if (clickedTextarea && (
+                clickedTextarea.classList.contains('message-edit-textarea') ||
+                clickedTextarea.classList.contains('system-prompt-input-field')
+            )) {
+                return;
+            }
+            
+            const isInteractive = e.target.tagName === 'BUTTON' ||
+                e.target.tagName === 'A' ||
+                e.target.tagName === 'INPUT' ||
+                e.target.tagName === 'SELECT' ||
+                e.target.closest('.input-field') ||
+                e.target.closest('.send-button') ||
+                e.target.closest('.settings-drawer') ||
+                e.target.closest('.message-action-btn') ||
+                e.target.closest('button') ||
+                e.target.closest('a') ||
+                e.target.closest('.system-prompt-pinned-header');
+            
+            if (isInteractive) return;
+            
+            setEditingMessageId(null);
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, [editingMessageId]);
+
+    const value = {
+        // State
+        prompts, currentPromptId, currentPrompt, activeConversationId,
+        messages, config, isResponding, settingsOpen, settingsDefaultSection, senderRole,
+        editingMessageId, undoNotification, configSavedModels, configSavedResilience, currentRoute,
+        selectedActivityMessageId, isBackendPanelOpen,
+        serverHealth,
+        // Setters
+        setConfig, setSettingsOpen, setSettingsDefaultSection, setSenderRole, setEditingMessageId, setCurrentRoute,
+        setSelectedActivityMessageId, setIsBackendPanelOpen, theme, setTheme,
+        // Actions
+        createPrompt, openPrompt, deletePrompt, renamePrompt,
+        sendMessage, abortRequest, addMessage, deleteMessage, editMessage, regenerateMessage,
+        saveVersion, loadVersion, deleteVersion,
+        newConversation, switchConversation, deleteConversation,
+        branchAtMessage, setSystemPrompt, saveConversation, undo,
+        exportConversation, importConversation,
+        getVersions, getConversations, getBestVersion, toggleBestVersion, refreshPrompts, hideUndoNotification,
+        refreshServerHealth, reportApiSuccess, reportApiFailure
+    };
+
+    return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+}

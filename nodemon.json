@@ -1,0 +1,9 @@
+{
+  "watch": ["server"],
+  "ext": "ts,js,json",
+  "ignore": ["node_modules", "client", "*.html", "*.css"],
+  "exec": "tsx --env-file=.env server/app.ts",
+  "env": {
+    "NODE_ENV": "development"
+  }
+}
